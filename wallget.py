@@ -21,8 +21,8 @@ def main():
         print(f'Please run as admin: sudo python3 "{__file__}"')
         exit()
 
-    print("WallGet Live Wallpaper Download Script")
-    print("--------------------------------------\n")
+    print("WallGet Live Wallpaper Download/Delete Script")
+    print("---------------------------------------------\n")
 
     # Validate environment
     if not os.path.isdir(IDLEASSETSD_PATH):
@@ -55,7 +55,7 @@ def main():
     print(f"{item + 1}. All")
 
     # Select category
-    category_index = as_int(input("\nCategory number to download? "))
+    category_index = as_int(input("\nCategory number? "))
     if category_index < 1 or category_index > item + 1:
         print("\nNo category selected.")
         exit()
@@ -64,7 +64,7 @@ def main():
     )
 
     # Download or delete?
-    action = input("\nDownload or delete? (d/x) ").strip().lower()
+    action = input("\n(d)Download or (x)delete? (d/x) ").strip().lower()
     if action != "d" and action != "x":
         print("\nNo action selected.")
         exit()
