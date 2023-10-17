@@ -1,16 +1,16 @@
-# WallGet Live Wallpaper Download Script for macOS
+# WallGet Live Wallpaper Download/Delete Script for macOS
 
 By [Mike Swanson](http://blog.mikeswanson.com/)
 
-I love the live wallpaper videos in macOS Sonoma, but I don't like that I have to download each video individually. So, until Apple adds a "download all" button to their Wallpaper settings, you can use this script.
+I love the live wallpaper videos in macOS Sonoma, but I don't like that I have to download each video individually. So, until Apple adds a "download all" button to their Wallpaper settings, you can use this script. It can also delete unwanted files to free-up disk space.
 
-The script allows you to download just one wallpaper category (e.g. "Earth") at a time, or you can choose to download all categories at once (which currently results in 134 video files and ~65 GB of data). The downloaded files are placed where macOS expects them.
+The script allows you to download/delete just one wallpaper category (e.g. "Earth") at a time, or you can choose to downloa/delete all categories at once (which currently results in 134 video files and ~65 GB of data). Downloaded files are placed where macOS expects them.
 
-After downloads complete, the script can optionally kill the **idleassetsd** process (or you can just restart your Mac). Either of these operations causes **idleassetsd** to update the now-downloaded status of each file.
+After downloads/deletes complete, the script can optionally kill the **idleassetsd** process (or you can just restart your Mac). Either of these operations causes **idleassetsd** to update the now-downloaded status of each file.
 
 ## Requirements
 
-This script only makes sense on macOS Sonoma (and presumably future OS releases), and it requires admin permission to write to the correct wallpaper folder.
+This script only makes sense on macOS Sonoma (and presumably future OS releases), and it requires admin permission to write to or delete from the correct wallpaper folder.
 
 ## Setup
 
@@ -30,8 +30,10 @@ If you're a non-programmer, you may see a pop-up window asking you to install th
 
 After entering your admin password, you should be presented with a numbered list of live wallpaper categories, including a final "All" category. To see the videos in each category, you can preview them in the Settings app under Wallpaper (or right-click the desktop and choose **Change Wallpaper...**). Select a category to continue.
 
-The script determines the required storage space for the selected files, reports the total, and prompts to continue. Note that the script only downloads files that don't exist or have mismatched file sizes (possibly because a prior download failed part-way through). Confirm the download to continue.
+You're then asked if you want to download or delete the selected category. Respond "d" to download or "x" to delete.
 
-When all downloads are complete, you are prompted to optionally kill the **idleassetsd** process so that each wallpaper's download status is correctly reflected in the Settings app. If you choose not to do this, you can simply restart your Mac.
+The script determines the storage space for the selected files, reports the total, and prompts to continue. Note that the script only downloads files that don't exist or have mismatched file sizes (possibly because a prior download failed part-way through). Confirm with a 'y' to continue.
+
+When all downloads/deletes are complete, you are prompted to optionally kill the **idleassetsd** process so that each wallpaper's download status is correctly reflected in the Settings app. If you choose not to do this, you can simply restart your Mac.
 
 I hope that this is useful!
