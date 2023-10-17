@@ -63,15 +63,20 @@ def main():
         categories[int(category_index) - 1]["id"] if category_index <= item else None
     )
 
-    # Determine downloads
-    print("\nDetermining download size...", end="")
-    downloads = []
-    bytes_required = 0
+    # Download or delete?
+    action = input("\nDownload or delete? (d/x) ").strip().lower()
+    if action != "d" and action != "x":
+        print("\nNo action selected.")
+        exit()
+    action_text = "download" if action == "d" else "delete"
+
+    # Determine items
+    print(f"\nDetermining {action_text} size...", end="")
+    items = []
+    total_bytes = 0
     for asset in asset_entries.get("assets", []):
         if category_id and category_id not in asset.get("categories", []):
             continue
-
-        print(".", end="", flush=True)
 
         label = strings.get(asset.get("localizedNameKey", ""), "")
         id = asset.get("id", "")
@@ -83,45 +88,56 @@ def main():
         if not label or not id or not url:
             continue
 
-        content_length = get_content_length(url)
         path = urllib.parse.urlparse(url).path
         ext = os.path.splitext(path)[1]
         file_path = f"{VIDEO_PATH}/{id}{ext}"
 
         # Download if file doesn't exist or is the wrong size
-        if (
-            not os.path.isfile(file_path)
-            or os.path.getsize(file_path) != content_length
-        ):
-            downloads.append((label, url, file_path))
-            bytes_required += content_length
+        file_exists = os.path.isfile(file_path)
+        file_size = os.path.getsize(file_path) if file_exists else 0
+        if action == "d":
+            content_length = get_content_length(url)
+            print(".", end="", flush=True)
+            if not file_exists or file_size != content_length:
+                items.append((label, url, file_path))
+                total_bytes += content_length
+        elif action == "x" and file_exists:
+            items.append((label, url, file_path))
+            total_bytes += file_size
 
     print("done.\n")
 
-    # Anything to download?
-    if not downloads:
-        print("Nothing to download.")
+    # Anything to process?
+    if not items:
+        print(f"Nothing to {action_text}.")
         exit()
 
     # Disk space check
     free_space = shutil.disk_usage("/").free
     print(f"Available space: {format_bytes(free_space)}")
-    print(f"Files to download ({len(downloads)}): {format_bytes(bytes_required)}")
-    if bytes_required > free_space:
+    print(f"Files to {action_text} ({len(items)}): {format_bytes(total_bytes)}")
+    if action == "d" and total_bytes > free_space:
         print("Not enough disk space to download all files.")
         exit()
 
-    proceed = input("Download files? (y/n) ").strip().lower()
+    proceed = input(f"{action_text.capitalize()} files? (y/n) ").strip().lower()
     if proceed != "y":
         exit()
 
-    start_time = time.time()
-    print("\nDownloading...")
-    results = ThreadPool().imap_unordered(download_file, downloads)
-    for result in results:
-        print(f"  Downloaded '{result}'")
-
-    print(f"\nDownloaded {len(downloads)} files in {time.time() - start_time:.1f}s.")
+    if action == "d":
+        start_time = time.time()
+        print("\nDownloading...")
+        results = ThreadPool().imap_unordered(download_file, items)
+        for result in results:
+            print(f"  Downloaded '{result}'")
+        print(f"\nDownloaded {len(items)} files in {time.time() - start_time:.1f}s.")
+    elif action == "x":
+        print("\nDeleting...")
+        for item in items:
+            label, _, file_path = item
+            os.remove(file_path)
+            print(f"  Deleted '{label}'")
+        print(f"\nDeleted {len(items)} files.")
 
     # Optionally kill idleassetsd to update wallpaper status
     should_kill = (
