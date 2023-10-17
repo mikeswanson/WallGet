@@ -4,7 +4,7 @@ By [Mike Swanson](http://blog.mikeswanson.com/)
 
 I love the live wallpaper videos in macOS Sonoma, but I don't like that I have to download each video individually. So, until Apple adds a "download all" button to their Wallpaper settings, you can use this script. It can also delete unwanted files to free-up disk space.
 
-The script allows you to download/delete just one wallpaper category (e.g. "Earth") at a time, or you can choose to downloa/delete all categories at once (which currently results in 134 video files and ~65 GB of data). Downloaded files are placed where macOS expects them.
+The script allows you to download/delete just one wallpaper category (e.g. "Earth") at a time, or you can choose to download/delete all categories at once (which currently results in 134 video files and ~65 GB of data). Downloaded files are placed where macOS expects them.
 
 After downloads/deletes complete, the script can optionally kill the **idleassetsd** process (or you can just restart your Mac). Either of these operations causes **idleassetsd** to update the now-downloaded status of each file.
 
