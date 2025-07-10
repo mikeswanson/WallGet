@@ -63,17 +63,8 @@ def main():
         categories[int(category_index) - 1]["id"] if category_index <= item else None
     )
 
-    # Download or delete?
-    action = input("\n(d)Download or (x)delete? (d/x) ").strip().lower()
-    if action != "d" and action != "x":
-        print("\nNo action selected.")
-        exit()
-    action_text = "download" if action == "d" else "delete"
-
-    # Determine items
-    print(f"\nDetermining {action_text} size...", end="")
-    items = []
-    total_bytes = 0
+    # Determine items (collect all possible wallpapers in the category first)
+    possible_items = []
     for asset in asset_entries.get("assets", []):
         if category_id and category_id not in asset.get("categories", []):
             continue
@@ -91,20 +82,78 @@ def main():
         path = urllib.parse.urlparse(url).path
         ext = os.path.splitext(path)[1]
         file_path = f"{VIDEO_PATH}/{id}{ext}"
+        possible_items.append((label, url, file_path))
 
-        # Download if file doesn't exist or is the wrong size
+    # Show wallpaper list and allow selection
+    print("\nWallpapers:")
+    for idx, (label, url, file_path) in enumerate(possible_items, 1):
+        print(f"{idx}. {label}")
+    print("(Press Enter to select all wallpapers in this category)")
+    selection = input("Select wallpaper(s) by number (comma-separated), or Enter for all: ").strip()
+    if selection:
+        try:
+            selected_indices = [int(x) - 1 for x in selection.split(",") if x.strip().isdigit()]
+            possible_items = [possible_items[i] for i in selected_indices if 0 <= i < len(possible_items)]
+        except Exception:
+            print("Invalid selection.")
+            exit()
+    # Now possible_items contains only the selected wallpapers
+
+    # Download or delete?
+    action = input("\n(d)Download or (x)delete? (d/x) ").strip().lower()
+    if action != "d" and action != "x":
+        print("\nNo action selected.")
+        exit()
+    action_text = "download" if action == "d" else "delete"
+
+    # Ask if user wants to force download (after action is defined)
+    force_download = False
+    if possible_items and action == "d":
+        force = input("Force download even if file exists? (y/n) ").strip().lower()
+        force_download = (force == "y")
+
+    # Determine items to process (filter by download/delete logic)
+    print(f"\nDetermining {action_text} size...", end="\n")
+    items = []
+    total_bytes = 0
+    for label, url, file_path in possible_items:
         file_exists = os.path.isfile(file_path)
         file_size = os.path.getsize(file_path) if file_exists else 0
+        remote_size = -1
+        remote_error = None
         if action == "d":
-            content_length = get_content_length(url)
-            print(".", end="", flush=True)
-            if not file_exists or file_size != content_length:
+            try:
+                remote_size = get_content_length(url)
+            except Exception as e:
+                remote_error = str(e)
+            print(f"  {label}:")
+            print(f"    Path: {file_path}")
+            print(f"    Exists: {file_exists}")
+            print(f"    Local size: {file_size if file_exists else 'N/A'}")
+            print(f"    Remote size: {remote_size if remote_error is None else 'ERROR: ' + remote_error}")
+            if remote_error is not None:
+                print(f"    Skipped: Could not determine remote file size.")
+                continue
+            if force_download:
                 items.append((label, url, file_path))
-                total_bytes += content_length
-        elif action == "x" and file_exists:
-            items.append((label, url, file_path))
-            total_bytes += file_size
-
+                total_bytes += remote_size
+                print(f"    Will be downloaded (force).")
+            elif not file_exists or file_size != remote_size:
+                items.append((label, url, file_path))
+                total_bytes += remote_size
+                print(f"    Will be downloaded.")
+            else:
+                print(f"    Skipped: Already exists and size matches.")
+        elif action == "x":
+            print(f"  {label}:")
+            print(f"    Path: {file_path}")
+            print(f"    Exists: {file_exists}")
+            if file_exists:
+                items.append((label, url, file_path))
+                total_bytes += file_size
+                print(f"    Will be deleted.")
+            else:
+                print(f"    Skipped: File does not exist.")
     print("done.\n")
 
     # Anything to process?
