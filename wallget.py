@@ -808,18 +808,62 @@ def get_content_length(url: str) -> int:
 def download_file(download: Tuple[str, str, str]) -> str:
     label, url, file_path = download
     parsed_url = urllib.parse.urlparse(url)
-    conn = connect(parsed_url)
-    path = parsed_url.path or "/"
-    if parsed_url.query:
-        path = f"{path}?{parsed_url.query}"
-    conn.request("GET", path)
-    r = conn.getresponse()
-    if r.status == 200:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(r, f)
-    conn.close()
-    return label
+
+    import time
+
+    def download_with_retries(max_retries=5):
+        for attempt in range(1, max_retries + 1):
+            conn = connect(parsed_url)
+            try:
+                path = parsed_url.path or "/"
+                if parsed_url.query:
+                    path = f"{path}?{parsed_url.query}"
+
+                conn.request("GET", path)
+                r = conn.getresponse()
+
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}: {r.reason}")
+
+                content_length = r.getheader("Content-Length")
+                expected_size = int(content_length) if content_length else None
+
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+                bytes_written = 0
+                CHUNK = 64 * 1024
+
+                with open(file_path, "wb") as f:
+                    while True:
+                        chunk = r.read(CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+
+                conn.close()
+
+                if expected_size is not None and bytes_written != expected_size:
+                    raise RuntimeError(
+                        f"Incomplete download: expected {expected_size}, got {bytes_written}"
+                    )
+
+                return label
+
+            except Exception as e:
+                if os.path.exists(file_path):
+                    try: os.remove(file_path)
+                    except OSError: pass
+
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"Download failed after {max_retries} attempts: {e}"
+                    )
+
+                time.sleep(1 + attempt * 0.5)
+
+    return download_with_retries()
+
 
 
 if __name__ == "__main__":
