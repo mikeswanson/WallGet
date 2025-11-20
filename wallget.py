@@ -841,8 +841,6 @@ def download_file(download: Tuple[str, str, str]) -> str:
                         f.write(chunk)
                         bytes_written += len(chunk)
 
-                conn.close()
-
                 if expected_size is not None and bytes_written != expected_size:
                     raise RuntimeError(
                         f"Incomplete download: expected {expected_size}, got {bytes_written}"
@@ -861,6 +859,11 @@ def download_file(download: Tuple[str, str, str]) -> str:
                     )
 
                 time.sleep(1 + attempt * 0.5)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     return download_with_retries()
 
