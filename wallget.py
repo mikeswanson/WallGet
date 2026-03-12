@@ -144,12 +144,17 @@ else:
 def _pick_loctable_strings(raw: Dict[str, Dict[str, str]]) -> Dict[str, str]:
     """Select the best locale from a .loctable plist.
 
-    Tries: exact system locale (e.g. 'ko_KR'), language prefix (e.g. 'ko'),
-    then 'en', then falls back to the first available locale.
+    Tries: exact system locale (e.g. 'ko_KR'), two-component prefix (e.g. 'zh_Hans'),
+    language prefix (e.g. 'ko'), then 'en', then falls back to the first available locale.
     """
+    # guard: if plist is already flat (not locale-keyed), return it directly
+    if raw and not isinstance(next(iter(raw.values())), dict):
+        return raw  # type: ignore[return-value]
     sys_locale = (locale.getlocale()[0] or "").replace("-", "_")
-    lang = sys_locale.split("_")[0] if sys_locale else ""
-    for candidate in (sys_locale, lang, "en"):
+    parts = sys_locale.split("_")
+    lang = parts[0]
+    two_component = "_".join(parts[:2]) if len(parts) >= 2 else ""
+    for candidate in (sys_locale, two_component, lang, "en"):
         if candidate and candidate in raw:
             return raw[candidate]
     return next(iter(raw.values()), {})
