@@ -1,5 +1,6 @@
 import http.client
 import json
+import locale
 import os
 import plistlib
 import pwd
@@ -87,12 +88,26 @@ USER_AERIALS_BASE = os.path.join(
     USER_HOME, "Library", "Application Support", "com.apple.wallpaper", "aerials"
 )
 USER_MANIFEST_PATH = os.path.join(USER_AERIALS_BASE, "manifest", "entries.json")
-USER_STRINGS_PATH = os.path.join(
+USER_STRINGS_PATH_LOCTABLE = os.path.join(
+    USER_AERIALS_BASE,
+    "manifest",
+    "TVIdleScreenStrings.bundle",
+    "Contents",
+    "Resources",
+    "Localizable.nocache.loctable",
+)
+USER_STRINGS_PATH_STRINGS = os.path.join(
     USER_AERIALS_BASE,
     "manifest",
     "TVIdleScreenStrings.bundle",
     "en.lproj",
     "Localizable.nocache.strings",
+)
+# macOS 26+ uses .loctable; earlier versions use .strings
+USER_STRINGS_PATH = (
+    USER_STRINGS_PATH_LOCTABLE
+    if os.path.isfile(USER_STRINGS_PATH_LOCTABLE)
+    else USER_STRINGS_PATH_STRINGS
 )
 USER_VIDEO_PATH = os.path.join(USER_AERIALS_BASE, "videos")
 
@@ -126,6 +141,25 @@ else:
     ACTIVE_VIDEO_PATH = ""
 
 
+def _pick_loctable_strings(raw: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """Select the best locale from a .loctable plist.
+
+    Tries: exact system locale (e.g. 'ko_KR'), two-component prefix (e.g. 'zh_Hans'),
+    language prefix (e.g. 'ko'), then 'en', then falls back to the first available locale.
+    """
+    # guard: if plist is already flat (not locale-keyed), return it directly
+    if raw and not isinstance(next(iter(raw.values())), dict):
+        return raw  # type: ignore[return-value]
+    sys_locale = (locale.getlocale()[0] or "").replace("-", "_")
+    parts = sys_locale.split("_")
+    lang = parts[0]
+    two_component = "_".join(parts[:2]) if len(parts) >= 2 else ""
+    for candidate in (sys_locale, two_component, lang, "en"):
+        if candidate and candidate in raw:
+            return raw[candidate]
+    return next(iter(raw.values()), {})
+
+
 def load_manifest(entries_path: str, strings_path: str) -> Optional[Dict[str, object]]:
     if not (
         entries_path
@@ -137,7 +171,12 @@ def load_manifest(entries_path: str, strings_path: str) -> Optional[Dict[str, ob
     with open(entries_path) as fp:
         entries = json.load(fp)
     with open(strings_path, "rb") as fp:
-        strings = plistlib.load(fp)
+        raw_strings = plistlib.load(fp)
+    # .loctable files are locale-keyed; pick the best match for this system
+    if strings_path.endswith(".loctable"):
+        strings = _pick_loctable_strings(raw_strings)
+    else:
+        strings = raw_strings
     return {"entries": entries, "strings": strings}
 
 
