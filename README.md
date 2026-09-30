@@ -10,7 +10,11 @@ WallGet automates downloading and deleting the live wallpaper videos that ship w
 - Presents each category with a total item count and supports selecting a single category or the entire catalog.
 - Lists every asset in the chosen category, including its download status and file size, and accepts individual numbers, ranges, or an `All` option when selecting items to process.
 - Downloads only the files that are missing or incomplete, or deletes the selected files from disk.
+- Downloads to a temporary `.part` file and renames atomically, so a crash or `Ctrl-C` never leaves a partial video where macOS looks for real assets. Interrupted transfers resume automatically on the next run.
+- Uses verified HTTPS (Apple's CDN certificate chain) with network timeouts, retries, and a bounded number of concurrent connections.
 - Optionally restarts `idleassetsd` after legacy-mode changes so Wallpaper settings immediately reflect the new state.
+
+> **Storage note:** the full catalog is roughly 60 GB of high-bitrate 240 fps video. macOS may also re-download aerials on its own while a Shuffle/Aerial wallpaper or screen saver is active, so deleting files does not guarantee they stay deleted until you switch those settings to non-aerial choices.
 
 ## Requirements
 
@@ -50,6 +54,27 @@ WallGet will detect the active storage location:
   ```
 
   After actions complete in legacy mode, WallGet offers to kill the `idleassetsd` daemon so Wallpaper settings immediately display the updated download state. If you decline, a reboot will update the status as well.
+
+## Command-Line Automation
+
+Running the script without arguments opens the interactive menu. For scheduled or scripted use, everything can be driven with flags instead:
+
+```bash
+# Download every missing aerial, no prompts
+python3 wallget.py --category all --assets all --download --yes
+
+# Delete one category by name
+python3 wallget.py --category Earth --delete --yes
+
+# Interactive category menu, then download assets 1-4 and 8
+python3 wallget.py --assets 1-4,8 --download
+```
+
+- `--category CATEGORY` accepts a category id or display name (case-insensitive), or `all`. Omit it to pick interactively (or to mean all, when combined with `--assets`).
+- `--assets SELECTION` accepts the same numbers/ranges as the interactive prompt, or `all`.
+- `--download` / `--delete` pick the action; one of them is required whenever you pass `--category` or `--assets`.
+- `--yes` (`-y`) skips the confirmation prompt (and the legacy `idleassetsd` restart prompt).
+- A failed or interrupted download leaves its `.part` file in place; re-running the same command resumes it instead of starting over.
 
 ## Using WallGet
 

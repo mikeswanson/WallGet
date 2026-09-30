@@ -1,3 +1,4 @@
+import argparse
 import http.client
 import json
 import locale
@@ -22,6 +23,9 @@ STORAGE_MODE_USER = "user"
 STORAGE_MODE_LEGACY = "legacy"
 ACTION_DOWNLOAD = "d"
 ACTION_DELETE = "x"
+HTTP_TIMEOUT = 30
+MAX_WORKERS = 4
+PARTIAL_SUFFIX = ".part"
 
 
 @dataclass
@@ -373,7 +377,12 @@ def assess_asset_status(
     task: Tuple[str, str, List[str]],
 ) -> Tuple[str, Optional[int], bool]:
     asset_id, url, existing = task
-    content_length = get_content_length(url)
+    try:
+        content_length = get_content_length(url)
+    except (OSError, http.client.HTTPException):
+        # Treat an unreachable CDN as "size unknown" instead of aborting
+        # the whole status pass.
+        content_length = -1
     if content_length <= 0:
         content_length = None
     up_to_date = False
@@ -400,7 +409,7 @@ def gather_asset_status(
         asset_status[asset.id] = AssetStatus(existing_paths=existing)
         status_tasks.append((asset.id, asset.url, existing))
 
-    pool = ThreadPool()
+    pool = ThreadPool(processes=MAX_WORKERS)
     completed_status_checks = 0
     try:
         for asset_id, content_length, up_to_date in pool.imap_unordered(
@@ -576,6 +585,41 @@ def main():
         print(f'Please run as admin: sudo python3 "{__file__}"')
         exit()
 
+    parser = argparse.ArgumentParser(
+        description="Download or delete macOS aerial wallpaper videos. "
+        "Run without arguments for the interactive menu."
+    )
+    parser.add_argument(
+        "--category",
+        metavar="CATEGORY",
+        help="category id or name (case-insensitive), or 'all'",
+    )
+    parser.add_argument(
+        "--assets",
+        metavar="SELECTION",
+        help="asset numbers, e.g. '1-4,8', or 'all' (defaults to all)",
+    )
+    action_group = parser.add_mutually_exclusive_group(required=False)
+    action_group.add_argument(
+        "--download", action="store_true", help="download missing files"
+    )
+    action_group.add_argument(
+        "--delete", action="store_true", help="delete selected files"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="skip confirmation prompts (non-interactive)",
+    )
+    args = parser.parse_args()
+
+    non_interactive = bool(
+        args.category or args.assets or args.download or args.delete
+    )
+    if non_interactive and not (args.download or args.delete):
+        parser.error("--download or --delete is required outside interactive mode")
+
     print("WallGet Live Wallpaper Download/Delete Script")
     print("---------------------------------------------\n")
 
@@ -627,30 +671,48 @@ def main():
         name = strings.get(localized_key, category_id)
         category_menu.append((category_id, name))
 
-    number_width = len(str(len(category_menu) + 1))
-    name_width = max(
-        [len(name) for _, name in category_menu] + [len("All")]
-    )
-
-    for idx, (cat_id, name) in enumerate(category_menu, start=1):
-        count = category_asset_counts.get(cat_id, 0)
-        print(
-            f"{str(idx).rjust(number_width)}. {name.ljust(name_width)}  ({count})"
+    if not non_interactive:
+        number_width = len(str(len(category_menu) + 1))
+        name_width = max(
+            [len(name) for _, name in category_menu] + [len("All")]
         )
-    print(
-        f"{str(len(category_menu) + 1).rjust(number_width)}. "
-        f"{'All'.ljust(name_width)}  ({len(assets)})"
-    )
 
-    category_index = as_int(input("\nCategory number? "))
-    if category_index < 1 or category_index > len(category_menu) + 1:
-        print("\nNo category selected.")
-        exit()
-    category_id = (
-        category_menu[category_index - 1][0]
-        if category_index <= len(category_menu)
-        else None
-    )
+        for idx, (cat_id, name) in enumerate(category_menu, start=1):
+            count = category_asset_counts.get(cat_id, 0)
+            print(
+                f"{str(idx).rjust(number_width)}. {name.ljust(name_width)}  ({count})"
+            )
+        print(
+            f"{str(len(category_menu) + 1).rjust(number_width)}. "
+            f"{'All'.ljust(name_width)}  ({len(assets)})"
+        )
+
+        category_index = as_int(input("\nCategory number? "))
+        if category_index < 1 or category_index > len(category_menu) + 1:
+            print("\nNo category selected.")
+            exit()
+        category_id = (
+            category_menu[category_index - 1][0]
+            if category_index <= len(category_menu)
+            else None
+        )
+    else:
+        category_id = None
+        if args.category:
+            needle = args.category.strip().lower()
+            if needle != "all":
+                matches = [
+                    cat_id
+                    for cat_id, name in category_menu
+                    if needle in (cat_id.lower(), name.lower())
+                ]
+                if len(matches) != 1:
+                    listing = ", ".join(name for _, name in category_menu)
+                    parser.error(
+                        f"category '{args.category}' matched {len(matches)} "
+                        f"categories (expected 1). Available: {listing}, all"
+                    )
+                category_id = matches[0]
 
     applicable_assets = [
         asset for asset in assets if not category_id or category_id in asset.categories
@@ -660,8 +722,8 @@ def main():
         exit()
 
     selected_category_name = (
-        category_menu[category_index - 1][1]
-        if category_index <= len(category_menu)
+        next(name for cat_id, name in category_menu if cat_id == category_id)
+        if category_id
         else "All"
     )
 
@@ -673,16 +735,20 @@ def main():
         selected_category_name,
         asset_status,
     )
-    render_asset_groups(grouped_rows)
-    if display_rows:
-        print()
+    if not non_interactive:
+        render_asset_groups(grouped_rows)
+        if display_rows:
+            print()
     index_to_asset = {row.index: row.asset for row in display_rows}
     max_index = len(index_to_asset)
-    print(f"{max_index + 1}. All")
 
-    selection_raw = input(
-        "\nAsset numbers? (ranges/comma-separated, e.g. 1-4,8) "
-    ).strip()
+    if non_interactive:
+        selection_raw = (args.assets or "all").strip()
+    else:
+        print(f"{max_index + 1}. All")
+        selection_raw = input(
+            "\nAsset numbers? (ranges/comma-separated, e.g. 1-4,8) "
+        ).strip()
     max_choice = max_index + 1
     if not selection_raw:
         print("\nNo assets selected.")
@@ -704,13 +770,16 @@ def main():
         index_to_asset[idx] for idx in sorted(selected_indices) if idx in index_to_asset
     ]
 
-    action = input("\n(d)Download or (x)delete? (d/x) ").strip().lower()
-    if action not in {ACTION_DOWNLOAD, ACTION_DELETE}:
-        print("\nNo action selected.")
-        exit()
+    if non_interactive:
+        action = ACTION_DOWNLOAD if args.download else ACTION_DELETE
+    else:
+        action = input("\n(d)Download or (x)delete? (d/x) ").strip().lower()
+        if action not in {ACTION_DOWNLOAD, ACTION_DELETE}:
+            print("\nNo action selected.")
+            exit()
     action_text = "download" if action == ACTION_DOWNLOAD else "delete"
 
-    items: List[Tuple[str, str, str]] = []
+    items: List[Tuple[str, str, str, Optional[int]]] = []
     total_bytes = 0
     delete_targets: List[Tuple[str, str]] = []
     queued_delete_paths: Set[str] = set()
@@ -733,7 +802,16 @@ def main():
             if up_to_date:
                 continue
             target_path = os.path.join(ACTIVE_VIDEO_PATH, f"{asset_id}{ext}")
-            items.append((label, url, target_path))
+            items.append(
+                (
+                    label,
+                    url,
+                    target_path,
+                    content_length
+                    if isinstance(content_length, int) and content_length > 0
+                    else None,
+                )
+            )
             if isinstance(content_length, int) and content_length > 0:
                 total_bytes += content_length
         else:
@@ -762,17 +840,41 @@ def main():
         print("Not enough disk space to download all files.")
         exit()
 
-    proceed = input(f"{action_text.capitalize()} files? (y/n) ").strip().lower()
-    if proceed != "y":
-        exit()
+    if not args.yes:
+        proceed = input(f"{action_text.capitalize()} files? (y/n) ").strip().lower()
+        if proceed != "y":
+            exit()
 
     if action == ACTION_DOWNLOAD:
         start_time = time.time()
         print("\nDownloading...")
-        results = ThreadPool().imap_unordered(download_file, tasks)
-        for result in results:
-            print(f"  Downloaded '{result}'")
-        print(f"\nDownloaded {len(tasks)} files in {time.time() - start_time:.1f}s.")
+        pool = ThreadPool(processes=MAX_WORKERS)
+        downloaded = 0
+        failures = 0
+        try:
+            for label, error in pool.imap_unordered(download_file, tasks):
+                if error:
+                    failures += 1
+                    print(f"  FAILED '{label}': {error}")
+                else:
+                    downloaded += 1
+                    print(f"  Downloaded '{label}'")
+        except KeyboardInterrupt:
+            failures += 1
+            print(
+                "\nInterrupted; partial transfers were kept as .part files "
+                "and can be resumed by re-running this command."
+            )
+        finally:
+            pool.terminate()
+            pool.join()
+        summary = (
+            f"\nDownloaded {downloaded} of {len(tasks)} files "
+            f"in {time.time() - start_time:.1f}s."
+        )
+        if failures:
+            summary += f" ({failures} failed or interrupted; re-run to resume.)"
+        print(summary)
     else:
         print("\nDeleting...")
         seen_paths: Set[str] = set()
@@ -784,7 +886,7 @@ def main():
             print(f"  Deleted '{label}'")
         print(f"\nDeleted {len(seen_paths)} files.")
 
-    if STORAGE_MODE == STORAGE_MODE_LEGACY:
+    if STORAGE_MODE == STORAGE_MODE_LEGACY and not args.yes:
         should_kill = (
             input("\nKill idleassetsd to update download status in Settings? (y/n) ")
             .strip()
@@ -822,57 +924,113 @@ def format_bytes(bytes: int) -> str:
 
 
 def connect(parsed_url: urllib.parse.ParseResult) -> http.client.HTTPConnection:
-    context = ssl._create_unverified_context()
+    # Default certificate verification is deliberate: these are multi-GB
+    # downloads from Apple's CDN, and skipping verification would invite
+    # silent tampering.
+    context = ssl.create_default_context()
     conn = (
-        http.client.HTTPSConnection(parsed_url.netloc, context=context)
+        http.client.HTTPSConnection(
+            parsed_url.netloc, context=context, timeout=HTTP_TIMEOUT
+        )
         if parsed_url.scheme == "https"
-        else http.client.HTTPConnection(parsed_url.netloc)
+        else http.client.HTTPConnection(parsed_url.netloc, timeout=HTTP_TIMEOUT)
     )
     return conn
+
+
+def request_path(parsed_url: urllib.parse.ParseResult) -> str:
+    path = parsed_url.path or "/"
+    if parsed_url.query:
+        path = f"{path}?{parsed_url.query}"
+    return path
 
 
 def get_content_length(url: str) -> int:
     parsed_url = urllib.parse.urlparse(url)
     conn = connect(parsed_url)
-    path = parsed_url.path or "/"
-    if parsed_url.query:
-        path = f"{path}?{parsed_url.query}"
-    conn.request("HEAD", path)
+    conn.request("HEAD", request_path(parsed_url))
     r = conn.getresponse()
-    content_length = int(r.getheader("Content-Length", -1))
+    try:
+        content_length = int(r.getheader("Content-Length", -1))
+    except (TypeError, ValueError):
+        content_length = -1
     conn.close()
     return content_length
 
 
-def download_file(download: Tuple[str, str, str]) -> str:
-    label, url, file_path = download
+def download_file(download: Tuple[str, str, str, Optional[int]]) -> Tuple[str, Optional[str]]:
+    """Download one asset and atomically place it at its final path.
+
+    Writes to a ``.part`` sibling file and renames on success, so a crash
+    never leaves a partial video where macOS looks for real assets. When a
+    previous ``.part`` exists and the server honours Range requests, the
+    transfer resumes from where it stopped.
+
+    ``expected_size`` (when known from the manifest HEAD check) lets an
+    already-complete ``.part`` be finalized without re-downloading, and
+    flags oversized leftovers for removal.
+
+    Returns ``(label, None)`` on success or ``(label, error)`` on failure so
+    one bad asset cannot abort the whole batch.
+    """
+    label, url, file_path, expected_size = download
     parsed_url = urllib.parse.urlparse(url)
+    part_path = file_path + PARTIAL_SUFFIX
 
-    import time
+    def parse_total(content_range: Optional[str]) -> Optional[int]:
+        if not content_range or "/" not in content_range:
+            return None
+        try:
+            return int(content_range.rsplit("/", 1)[-1])
+        except ValueError:
+            return None
 
-    def download_with_retries(max_retries=5):
-        for attempt in range(1, max_retries + 1):
+    def download_with_retries(max_retries: int = 5) -> None:
+        for attempt_no in range(1, max_retries + 1):
+            offset = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+            if expected_size is not None and offset == expected_size:
+                # A previous run finished the transfer but was interrupted
+                # before the rename.
+                os.replace(part_path, file_path)
+                return
+            if expected_size is not None and offset > expected_size:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+                offset = 0
             conn = connect(parsed_url)
             try:
-                path = parsed_url.path or "/"
-                if parsed_url.query:
-                    path = f"{path}?{parsed_url.query}"
-
-                conn.request("GET", path)
+                headers = {"Range": f"bytes={offset}-"} if offset else {}
+                conn.request("GET", request_path(parsed_url), headers=headers)
                 r = conn.getresponse()
 
-                if r.status != 200:
+                if r.status == 416 and offset:
+                    # Server rejected the resume position: drop the partial
+                    # and start clean on the next attempt.
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(f"HTTP {r.status}: {r.reason}")
+                if offset and r.status == 200:
+                    # Server ignored the Range header; start from scratch.
+                    offset = 0
+                elif r.status not in (200, 206):
                     raise RuntimeError(f"HTTP {r.status}: {r.reason}")
 
-                content_length = r.getheader("Content-Length")
-                expected_size = int(content_length) if content_length else None
+                if offset and r.status == 206:
+                    total = parse_total(r.getheader("Content-Range")) or expected_size
+                else:
+                    header_length = r.getheader("Content-Length")
+                    total = int(header_length) if header_length else expected_size
 
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-                bytes_written = 0
+                bytes_written = offset
                 CHUNK = 64 * 1024
 
-                with open(file_path, "wb") as f:
+                with open(part_path, "ab" if offset else "wb") as f:
                     while True:
                         chunk = r.read(CHUNK)
                         if not chunk:
@@ -880,31 +1038,30 @@ def download_file(download: Tuple[str, str, str]) -> str:
                         f.write(chunk)
                         bytes_written += len(chunk)
 
-                if expected_size is not None and bytes_written != expected_size:
+                if total is not None and bytes_written != total:
                     raise RuntimeError(
-                        f"Incomplete download: expected {expected_size}, got {bytes_written}"
+                        f"Incomplete download: expected {total}, got {bytes_written}"
                     )
 
-                return label
+                os.replace(part_path, file_path)
+                return
 
-            except Exception as e:
-                if os.path.exists(file_path):
-                    try: os.remove(file_path)
-                    except OSError: pass
-
-                if attempt == max_retries:
-                    raise RuntimeError(
-                        f"Download failed after {max_retries} attempts: {e}"
-                    )
-
-                time.sleep(1 + attempt * 0.5)
+            except Exception:
+                # Keep the .part file so a later run can resume.
+                if attempt_no == max_retries:
+                    raise
+                time.sleep(1 + attempt_no * 0.5)
             finally:
                 try:
                     conn.close()
                 except Exception:
                     pass
 
-    return download_with_retries()
+    try:
+        download_with_retries()
+        return label, None
+    except Exception as e:
+        return label, str(e)
 
 
 
