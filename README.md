@@ -14,7 +14,7 @@ WallGet automates downloading and deleting the live wallpaper videos that ship w
 - Uses verified HTTPS (Apple's CDN certificate chain) with network timeouts, retries, and a bounded number of concurrent connections.
 - Optionally restarts `idleassetsd` after legacy-mode changes so Wallpaper settings immediately reflect the new state.
 
-> **Storage note:** the full catalog is roughly 60 GB of high-bitrate 240 fps video. macOS may also re-download aerials on its own while a Shuffle/Aerial wallpaper or screen saver is active, so deleting files does not guarantee they stay deleted until you switch those settings to non-aerial choices.
+> **Storage note:** the full catalog is roughly 60 GB of high-bitrate 240 fps video. macOS may also re-download aerials on its own while a Shuffle/Aerial wallpaper or screen saver is active, so deleting files does not guarantee they stay deleted until you switch those settings to non-aerial choices. Beware: some wallpapers that look like still images are actually aerial assets — picking one from the Aerials category in Wallpaper settings (for example, a landmark aerial) silently re-enables downloads for the whole catalog.
 
 ## Requirements
 
