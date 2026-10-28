@@ -564,6 +564,10 @@ def parse_selection(selection: str, max_choice: int) -> Set[int]:
         token = part.strip()
         if not token:
             continue
+        if token.lower() == "all":
+            # max_choice is the trailing "All" entry, which main() expands.
+            chosen.add(max_choice)
+            continue
         if "-" in token:
             start_str, end_str = token.split("-", 1)
             start = as_int(start_str.strip())
