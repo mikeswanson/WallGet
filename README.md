@@ -55,6 +55,17 @@ WallGet will detect the active storage location:
 
   After actions complete in legacy mode, WallGet offers to kill the `idleassetsd` daemon so Wallpaper settings immediately display the updated download state. If you decline, a reboot will update the status as well.
 
+### Catalog sources
+
+On macOS 26/27 the per-user `manifest/` directory can be empty on a fresh install. WallGet looks for the wallpaper catalog in this order and prints the source it used:
+
+1. `~/Library/Application Support/com.apple.wallpaper/aerials/manifest/entries.json`
+2. `~/Library/Application Support/com.apple.wallpaper/aerials/manifest.tar`
+3. the catalog bundled with `WallpaperAerialsExtension.appex`
+4. Apple's current versioned catalog feed (requires network)
+
+All four are read-only; WallGet never modifies macOS's manifest or `manifest.tar`. If the printed source is not the local manifest, the catalog may lag a point release by one or two assets.
+
 ## Command-Line Automation
 
 Running the script without arguments opens the interactive menu. For scheduled or scripted use, everything can be driven with flags instead:
