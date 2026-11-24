@@ -55,6 +55,17 @@ WallGet will detect the active storage location:
 
   After actions complete in legacy mode, WallGet offers to kill the `idleassetsd` daemon so Wallpaper settings immediately display the updated download state. If you decline, a reboot will update the status as well.
 
+### Catalog sources
+
+On macOS 26/27 the user `manifest/` directory can be empty on a fresh install. WallGet looks for the catalog in this order and prints the source it used:
+
+1. `~/Library/Application Support/com.apple.wallpaper/aerials/manifest/entries.json`
+2. `~/Library/Application Support/com.apple.wallpaper/aerials/manifest.tar`
+3. the catalog bundled with `WallpaperAerialsExtension.appex`
+4. Apple's versioned catalog feed (requires network)
+
+All lookups are read-only. A fallback catalog may lag the local manifest by a point release.
+
 ## Command-Line Automation
 
 Running the script without arguments opens the interactive menu. For scheduled or scripted use, everything can be driven with flags instead:
@@ -73,7 +84,8 @@ python3 wallget.py --assets 1-4,8 --download
 - `--category CATEGORY` accepts a category id or display name (case-insensitive), or `all`. Omit it to pick interactively (or to mean all, when combined with `--assets`).
 - `--assets SELECTION` accepts the same numbers/ranges as the interactive prompt, or `all`.
 - `--download` / `--delete` pick the action; one of them is required whenever you pass `--category` or `--assets`.
-- `--yes` (`-y`) skips the confirmation prompt (and the legacy `idleassetsd` restart prompt).
+- `--yes` (`-y`) skips the confirmation prompt (and the legacy `idleassetsd` restart prompt). Non-interactive flags also skip it.
+- `--delete` requires `--category` or `--assets`; use `--assets all` to delete everything.
 - A failed or interrupted download leaves its `.part` file in place; re-running the same command resumes it instead of starting over.
 
 ## Using WallGet
