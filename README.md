@@ -6,7 +6,7 @@ WallGet automates downloading and deleting the live wallpaper videos that ship w
 
 ## Highlights
 
-- Detects whether wallpapers exist in the current user's folder (`~/Library/Application Support/com.apple.wallpaper/aerials`) or the legacy system folder (`/Library/Application Support/com.apple.idleassetsd`).
+- Detects whether wallpapers exist in the current user's folder (`~/Library/Application Support/com.apple.wallpaper/aerials`) or the legacy system folder (`/Library/Application Support/com.apple.idleassetsd`). On fresh macOS 26/27 installs the per-user `manifest/` directory can exist but be empty; WallGet then falls back, read-only, to `manifest.tar`, the catalog bundled inside `WallpaperAerialsExtension.appex`, and finally Apple's current versioned catalog feed. The chosen source is printed so you know which catalog you are seeing.
 - Presents each category with a total item count and supports selecting a single category or the entire catalog.
 - Lists every asset in the chosen category, including its download status and file size, and accepts individual numbers, ranges, or an `All` option when selecting items to process.
 - Downloads only the files that are missing or incomplete, or deletes the selected files from disk.
@@ -73,8 +73,17 @@ python3 wallget.py --assets 1-4,8 --download
 - `--category CATEGORY` accepts a category id or display name (case-insensitive), or `all`. Omit it to pick interactively (or to mean all, when combined with `--assets`).
 - `--assets SELECTION` accepts the same numbers/ranges as the interactive prompt, or `all`.
 - `--download` / `--delete` pick the action; one of them is required whenever you pass `--category` or `--assets`.
-- `--yes` (`-y`) skips the confirmation prompt (and the legacy `idleassetsd` restart prompt).
+- `--yes` (`-y`) skips the confirmation prompt (and the legacy `idleassetsd` restart prompt). Any non-interactive flag (`--category`, `--assets`, `--download`, `--delete`) also skips it, so scripted runs never block on `input()`.
+- `--delete` requires `--category` or `--assets`; use `--assets all` to delete every downloaded wallpaper. This prevents an accidental full delete from a bare `--delete`.
 - A failed or interrupted download leaves its `.part` file in place; re-running the same command resumes it instead of starting over.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite covers catalog discovery (local manifest, `manifest.tar`, system bundle, corrupt files), localization parsing, malformed manifests, and the `--assets all` selection path.
 
 ## Using WallGet
 

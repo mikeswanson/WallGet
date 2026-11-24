@@ -1,5 +1,6 @@
 import argparse
 import http.client
+import io
 import json
 import locale
 import os
@@ -7,18 +8,32 @@ import plistlib
 import pwd
 import shutil
 import ssl
+import subprocess
+import sys
+import tarfile
 import time
 import urllib.parse
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from multiprocessing.pool import ThreadPool
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, NoReturn, Optional, Set, Tuple
 
 LEGACY_IDLEASSETSD_PATH = "/Library/Application Support/com.apple.idleassetsd"
 LEGACY_STRINGS_PATH = f"{LEGACY_IDLEASSETSD_PATH}/Customer/TVIdleScreenStrings.bundle/en.lproj/Localizable.nocache.strings"
 LEGACY_ENTRIES_PATH = f"{LEGACY_IDLEASSETSD_PATH}/Customer/entries.json"
 LEGACY_VIDEO_PATH = f"{LEGACY_IDLEASSETSD_PATH}/Customer/4KSDR240FPS"
 ASSET_URL_KEY = "url-4K-SDR-240FPS"
+ASSET_URL_KEYS = (ASSET_URL_KEY, "url-4K-SDR", "url-4K", "url-1080", "url")
+SYSTEM_AERIALS_RESOURCES = os.path.join(
+    "/System", "Library", "ExtensionKit", "Extensions",
+    "WallpaperAerialsExtension.appex", "Contents", "Resources",
+)
+CONFIG_FEED_BASE = (
+    "https://configuration.apple.com/configurations/"
+    "internetservices/aerials/resources-config-{}-0.plist"
+)
+SYLVAN_BASE = "https://sylvan.apple.com"
 STORAGE_MODE_USER = "user"
 STORAGE_MODE_LEGACY = "legacy"
 ACTION_DOWNLOAD = "d"
@@ -78,11 +93,19 @@ class CategoryMaps:
 
 
 def resolve_user_home() -> str:
-    sudo_user = os.environ.get("SUDO_USER")
+    """Return the real user's home, including under sudo (issue #13 style false negatives)."""
+    try:
+        elevated = os.geteuid() == 0
+    except AttributeError:
+        elevated = False
+    sudo_user = os.environ.get("SUDO_USER") if elevated else None
     if sudo_user and sudo_user != "root":
         try:
             return pwd.getpwnam(sudo_user).pw_dir
         except KeyError:
+            home = os.environ.get("HOME", "")
+            if home and not home.startswith("/var/root"):
+                return home
             return os.path.expanduser(f"~{sudo_user}")
     return os.path.expanduser("~")
 
@@ -92,40 +115,36 @@ USER_AERIALS_BASE = os.path.join(
     USER_HOME, "Library", "Application Support", "com.apple.wallpaper", "aerials"
 )
 USER_MANIFEST_PATH = os.path.join(USER_AERIALS_BASE, "manifest", "entries.json")
-USER_STRINGS_PATH_LOCTABLE = os.path.join(
-    USER_AERIALS_BASE,
-    "manifest",
-    "TVIdleScreenStrings.bundle",
-    "Contents",
-    "Resources",
-    "Localizable.nocache.loctable",
-)
-USER_STRINGS_PATH_STRINGS = os.path.join(
-    USER_AERIALS_BASE,
-    "manifest",
-    "TVIdleScreenStrings.bundle",
-    "en.lproj",
-    "Localizable.nocache.strings",
-)
-# macOS 26+ uses .loctable; earlier versions use .strings
-USER_STRINGS_PATH = (
-    USER_STRINGS_PATH_LOCTABLE
-    if os.path.isfile(USER_STRINGS_PATH_LOCTABLE)
-    else USER_STRINGS_PATH_STRINGS
-)
+# macOS 26+ uses .loctable; earlier versions use .strings. Discover both layouts
+# rather than freezing one path at import time (issue #13 partial manifests).
+USER_STRINGS_PATH = ""
 USER_VIDEO_PATH = os.path.join(USER_AERIALS_BASE, "videos")
 
 
+def find_strings_path(base_dir: str) -> str:
+    """Find a localization table under a manifest directory, if present."""
+    bundle = os.path.join(base_dir, "TVIdleScreenStrings.bundle")
+    roots = [bundle] if os.path.isdir(bundle) else []
+    roots.append(base_dir)
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name in (
+                    "Localizable.nocache.loctable",
+                    "Localizable.nocache.strings",
+                    "Localizable.loctable",
+                    "Localizable.strings",
+                ):
+                    return os.path.join(dirpath, name)
+    return ""
+
+
 def detect_storage_mode() -> Optional[str]:
-    user_available = os.path.isfile(USER_MANIFEST_PATH) and os.path.isfile(
-        USER_STRINGS_PATH
-    )
-    if user_available:
+    """Pick the live storage location without requiring a complete manifest."""
+    if os.path.isdir(USER_AERIALS_BASE):
         return STORAGE_MODE_USER
-    legacy_available = os.path.isfile(LEGACY_ENTRIES_PATH) and os.path.isfile(
-        LEGACY_STRINGS_PATH
-    )
-    if legacy_available:
+    if os.path.isfile(LEGACY_ENTRIES_PATH):
         return STORAGE_MODE_LEGACY
     return None
 
@@ -133,6 +152,7 @@ def detect_storage_mode() -> Optional[str]:
 STORAGE_MODE = detect_storage_mode()
 if STORAGE_MODE == STORAGE_MODE_USER:
     ACTIVE_ENTRIES_PATH = USER_MANIFEST_PATH
+    USER_STRINGS_PATH = find_strings_path(os.path.join(USER_AERIALS_BASE, "manifest"))
     ACTIVE_STRINGS_PATH = USER_STRINGS_PATH
     ACTIVE_VIDEO_PATH = USER_VIDEO_PATH
 elif STORAGE_MODE == STORAGE_MODE_LEGACY:
@@ -145,55 +165,284 @@ else:
     ACTIVE_VIDEO_PATH = ""
 
 
-def _pick_loctable_strings(raw: Dict[str, Dict[str, str]]) -> Dict[str, str]:
-    """Select the best locale from a .loctable plist.
+def _safe_dict(value: object) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
-    Tries: exact system locale (e.g. 'ko_KR'), two-component prefix (e.g. 'zh_Hans'),
-    language prefix (e.g. 'ko'), then 'en', then falls back to the first available locale.
+
+def _safe_list(value: object) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _locale_candidates() -> List[str]:
+    candidates: List[str] = []
+    for name in ("LC_ALL", "LANG", "LANGUAGE"):
+        value = os.environ.get(name, "")
+        if value and value != "C":
+            for part in value.replace(":", ",").split(","):
+                cleaned = part.split("@", 1)[0].split(".", 1)[0]
+                if cleaned:
+                    candidates.append(cleaned)
+    try:
+        value = locale.getlocale()[0]
+    except (ValueError, OSError):
+        value = None
+    if value:
+        candidates.append(value)
+    normalized: List[str] = []
+    for value in candidates:
+        value = value.replace("-", "_").lower()
+        if value and value not in normalized:
+            normalized.append(value)
+    # macOS 'zh-Hans' style tags become zh_hans; 'en_US' is already close.
+    expanded: List[str] = []
+    for value in normalized:
+        parts = value.split("_")
+        for count in range(1, len(parts) + 1):
+            prefix = "_".join(parts[:count])
+            if prefix and prefix not in expanded:
+                expanded.append(prefix)
+    for fallback in ("en", "en_us"):
+        if fallback not in expanded:
+            expanded.append(fallback)
+    return expanded
+
+
+def _pick_loctable_strings(raw: object) -> Dict[str, str]:
+    """Select one locale dict from a .loctable plist.
+
+    Locale keys are dicts; metadata keys (e.g. LocProvenance) are not. Deciding
+    from a majority rather than the first key avoids dropping every asset when
+    a metadata key sorts before the locales.
     """
-    # guard: if plist is already flat (not locale-keyed), return it directly
-    if raw and not isinstance(next(iter(raw.values())), dict):
-        return raw  # type: ignore[return-value]
-    sys_locale = (locale.getlocale()[0] or "").replace("-", "_")
-    parts = sys_locale.split("_")
-    lang = parts[0]
-    two_component = "_".join(parts[:2]) if len(parts) >= 2 else ""
-    for candidate in (sys_locale, two_component, lang, "en"):
-        if candidate and candidate in raw:
-            return raw[candidate]
-    return next(iter(raw.values()), {})
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    locale_keys = [k for k, v in raw.items() if isinstance(v, dict)]
+    if not locale_keys:
+        # Already a flat key -> string table.
+        return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
+    normalized = {str(k).replace("-", "_").lower(): v for k, v in raw.items()
+                  if isinstance(v, dict)}
+    for candidate in _locale_candidates():
+        table = normalized.get(candidate)
+        if isinstance(table, dict):
+            return {str(k): str(v) for k, v in table.items() if isinstance(v, str)}
+    first = raw.get(locale_keys[0])
+    return ({str(k): str(v) for k, v in first.items() if isinstance(v, str)}
+            if isinstance(first, dict) else {})
+
+
+def _parse_strings(data: bytes, name: str) -> Dict[str, str]:
+    raw = plistlib.loads(data)
+    if name.endswith(".loctable") or (
+        isinstance(raw, dict)
+        and any(isinstance(v, dict) for v in raw.values())
+    ):
+        return _pick_loctable_strings(raw)
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
+    return {}
+
+
+def parse_manifest(
+    entries_data: bytes,
+    strings_data: Optional[bytes],
+    strings_name: str = "",
+) -> Optional[Dict[str, object]]:
+    """Parse catalog bytes from disk, a tar, or a download. Never raises."""
+    try:
+        entries = json.loads(entries_data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    entries = _safe_dict(entries)
+    if not _safe_list(entries.get("assets")):
+        return None
+    strings: Dict[str, str] = {}
+    if strings_data:
+        try:
+            strings = _parse_strings(strings_data, strings_name)
+        except (ValueError, TypeError, plistlib.InvalidFileException):
+            strings = {}
+    return {"entries": entries, "strings": strings}
+
+
+def manifest_from_paths(entries_path: str, strings_path: str) -> Optional[Dict[str, object]]:
+    if not (entries_path and os.path.isfile(entries_path)):
+        return None
+    try:
+        with open(entries_path, "rb") as fp:
+            entries_data = fp.read()
+        strings_data = None
+        name = strings_path
+        if strings_path and os.path.isfile(strings_path):
+            with open(strings_path, "rb") as fp:
+                strings_data = fp.read()
+    except OSError:
+        return None
+    return parse_manifest(entries_data, strings_data, name)
 
 
 def load_manifest(entries_path: str, strings_path: str) -> Optional[Dict[str, object]]:
-    if not (
-        entries_path
-        and strings_path
-        and os.path.isfile(entries_path)
-        and os.path.isfile(strings_path)
-    ):
+    """Compatibility wrapper used by callers and tests."""
+    return manifest_from_paths(entries_path, strings_path)
+
+
+def _tar_members(archive: tarfile.TarFile) -> Dict[str, Any]:
+    wanted_entries = ("entries.json", "./entries.json")
+    wanted_strings = (
+        "TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable",
+        "./TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable",
+    )
+    entries_data = strings_data = None
+    strings_name = ""
+    for member in archive.getmembers():
+        if not member.isfile():
+            continue
+        name = member.name[2:] if member.name.startswith("./") else member.name
+        if name in wanted_entries and entries_data is None:
+            handle = archive.extractfile(member)
+            entries_data = handle.read() if handle else None
+        elif name in wanted_strings and strings_data is None:
+            handle = archive.extractfile(member)
+            strings_data = handle.read() if handle else None
+            strings_name = name
+    if entries_data is None:
+        return {}
+    result = {"entries": entries_data}
+    if strings_data is not None:
+        result["strings"] = strings_data
+        result["strings_name"] = strings_name
+    return result
+
+
+def manifest_from_tar(path: str) -> Optional[Dict[str, object]]:
+    if not os.path.isfile(path):
         return None
-    with open(entries_path) as fp:
-        entries = json.load(fp)
-    with open(strings_path, "rb") as fp:
-        raw_strings = plistlib.load(fp)
-    # .loctable files are locale-keyed; pick the best match for this system
-    if strings_path.endswith(".loctable"):
-        strings = _pick_loctable_strings(raw_strings)
-    else:
-        strings = raw_strings
-    return {"entries": entries, "strings": strings}
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            members = _tar_members(archive)
+    except (OSError, tarfile.TarError):
+        return None
+    if not members:
+        return None
+    return parse_manifest(
+        members["entries"], members.get("strings"), members.get("strings_name", "")
+    )
+
+
+def read_url(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[bytes]:
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "WallGet/1"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+
+
+def _trusted_catalog_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in (
+        "sylvan.apple.com", "configuration.apple.com"
+    )
+
+
+def remote_catalog_urls(user_base: str) -> List[str]:
+    """Resolve Apple's current catalog URL; never hardcode a tar filename."""
+    urls: List[str] = []
+    source_path = os.path.join(user_base, "manifest", "manifest.source")
+    try:
+        with open(source_path, encoding="utf-8") as fp:
+            source = fp.read().strip()
+        candidate = SYLVAN_BASE + source if source.startswith("/") else ""
+        if candidate and _trusted_catalog_url(candidate):
+            urls.append(candidate)
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "com.apple.wallpaper.aerial", "remoteResourceURL"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+        value = result.stdout.decode("utf-8", "ignore").strip()
+        if value.startswith("https://") and _trusted_catalog_url(value):
+            urls.append(value)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for major in ("27", "26"):
+        plist_data = read_url(CONFIG_FEED_BASE.format(major), timeout=10)
+        if not plist_data:
+            continue
+        try:
+            feed = plistlib.loads(plist_data)
+        except plistlib.InvalidFileException:
+            continue
+        value = _safe_dict(feed).get("resources-url")
+        if (isinstance(value, str) and value.startswith("https://")
+                and _trusted_catalog_url(value)):
+            urls.append(value)
+    seen: Set[str] = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
+
+
+def resolve_manifest(user_base: str) -> Tuple[Optional[Dict[str, object]], str, List[str]]:
+    """Find a usable catalog from local, bundled or remote sources.
+
+    Returns (manifest, source description, diagnostics). All sources are
+    read-only: macOS remains the owner of its manifest files.
+    """
+    notes: List[str] = []
+    manifest_dir = os.path.join(user_base, "manifest")
+    entries_path = os.path.join(manifest_dir, "entries.json")
+    candidates = [
+        ("local manifest", lambda: manifest_from_paths(
+            entries_path, find_strings_path(manifest_dir))),
+        ("manifest.tar", lambda: manifest_from_tar(
+            os.path.join(user_base, "manifest.tar"))),
+        ("system bundle", lambda: manifest_from_paths(
+            os.path.join(SYSTEM_AERIALS_RESOURCES, "entries.json"),
+            find_strings_path(SYSTEM_AERIALS_RESOURCES))),
+    ]
+    for label, loader in candidates:
+        try:
+            manifest = loader()
+        except OSError as exc:
+            notes.append(f"{label}: {exc}")
+            continue
+        notes.append(f"{label}: {'ok' if manifest else 'unavailable'}")
+        if manifest:
+            return manifest, label, notes
+    for url in remote_catalog_urls(user_base):
+        data = read_url(url)
+        if not data:
+            notes.append(f"download failed: {url}")
+            continue
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+                members = _tar_members(archive)
+        except tarfile.TarError as exc:
+            notes.append(f"invalid download: {url} ({exc})")
+            continue
+        manifest = parse_manifest(
+            members.get("entries", b""), members.get("strings"),
+            members.get("strings_name", ""),
+        ) if members else None
+        notes.append(f"download {url}: {'ok' if manifest else 'unusable'}")
+        if manifest:
+            return manifest, "Apple catalog download", notes
+    return None, "", notes
 
 
 def extract_strings(manifest: Dict[str, object]) -> Dict[str, str]:
     merged: Dict[str, str] = {}
-    merged.update(manifest.get("strings", {}))
+    merged.update(_safe_dict(manifest.get("strings")))
     return merged
 
 
 def extract_categories(manifest: Dict[str, object]) -> List[Dict[str, object]]:
     categories: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
-    for category in manifest.get("entries", {}).get("categories", []):
+    for category in _safe_list(_safe_dict(manifest.get("entries")).get("categories")):
+        category = _safe_dict(category)
         cat_id = category.get("id")
         if not cat_id:
             continue
@@ -213,7 +462,8 @@ def build_category_maps(categories: Iterable[Dict[str, object]]) -> CategoryMaps
     representative_to_parent: Dict[str, str] = {}
     for category in categories:
         parent_id = category.get("id")
-        for sub in category.get("subcategories", []):
+        for sub in _safe_list(category.get("subcategories")):
+            sub = _safe_dict(sub)
             sub_id = sub.get("id")
             if sub_id:
                 subcategory_to_parent[sub_id] = parent_id
@@ -235,13 +485,14 @@ def extract_assets(
 ) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
     assets: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
-    for asset in manifest.get("entries", {}).get("assets", []):
+    for asset in _safe_list(_safe_dict(manifest.get("entries")).get("assets")):
+        asset = _safe_dict(asset)
         asset_id = asset.get("id")
-        if not asset_id:
+        if not isinstance(asset_id, str) or not asset_id:
             continue
         if asset_id not in assets:
             order.append(asset_id)
-        assets[asset_id] = dict(asset)
+        assets[asset_id] = asset
     return assets, order
 
 
@@ -292,20 +543,26 @@ def prepare_assets(
 
     for manifest_index, asset_id in enumerate(order):
         asset = assets.get(asset_id, {})
-        label = strings.get(asset.get("localizedNameKey", ""), "")
-        url = asset.get(ASSET_URL_KEY, "")
-        if not label or not url:
+        name_key = asset.get("localizedNameKey")
+        label = strings.get(name_key, "") if isinstance(name_key, str) else ""
+        if not label:
+            label = name_key if isinstance(name_key, str) and name_key else asset_id
+        url = ""
+        for key in ASSET_URL_KEYS:
+            candidate = asset.get(key)
+            if isinstance(candidate, str) and candidate:
+                url = candidate
+                break
+        if not url:
             continue
         parsed = urllib.parse.urlparse(url)
-        ext = os.path.splitext(parsed.path)[1]
-        if not ext:
-            continue
+        ext = os.path.splitext(parsed.path)[1] or ".mov"
 
         categories: Set[str] = set()
         subcat_ids: Set[str] = set()
         subcat_orders: List[int] = []
 
-        for cat_id in (asset.get("categories") or []):
+        for cat_id in _safe_list(asset.get("categories")):
             include_category(
                 cat_id,
                 categories=categories,
@@ -313,7 +570,7 @@ def prepare_assets(
                 subcat_orders=subcat_orders,
                 track_subcategory=False,
             )
-        for sub_id in (asset.get("subcategories") or []):
+        for sub_id in _safe_list(asset.get("subcategories")):
             include_category(
                 sub_id,
                 categories=categories,
@@ -398,9 +655,13 @@ def assess_asset_status(
 
 def gather_asset_status(
     applicable_assets: List[PreparedAsset],
+    check_remote: bool = True,
 ) -> Dict[str, AssetStatus]:
-    """Check remote file sizes to determine which assets need work."""
+    """Check remote file sizes to determine which assets need work.
 
+    Deleting never needs remote sizes; skipping them keeps delete usable
+    offline and avoids hundreds of CDN requests.
+    """
     print("\nGathering asset status...", end="")
     asset_status: Dict[str, AssetStatus] = {}
     status_tasks: List[Tuple[str, str, List[str]]] = []
@@ -408,6 +669,12 @@ def gather_asset_status(
         existing = existing_files(asset.id, asset.ext)
         asset_status[asset.id] = AssetStatus(existing_paths=existing)
         status_tasks.append((asset.id, asset.url, existing))
+
+    if not check_remote:
+        for asset_id, _url, existing in status_tasks:
+            asset_status[asset_id].up_to_date = bool(existing)
+        print("done.\n")
+        return asset_status
 
     pool = ThreadPool(processes=MAX_WORKERS)
     completed_status_checks = 0
@@ -584,11 +851,12 @@ def parse_selection(selection: str, max_choice: int) -> Set[int]:
     return chosen
 
 
-def main():
-    if STORAGE_MODE == STORAGE_MODE_LEGACY and os.geteuid() != 0:
-        print(f'Please run as admin: sudo python3 "{__file__}"')
-        exit()
+def fail(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
 
+
+def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         description="Download or delete macOS aerial wallpaper videos. "
         "Run without arguments for the interactive menu."
@@ -616,7 +884,21 @@ def main():
         action="store_true",
         help="skip confirmation prompts (non-interactive)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.delete and not (args.category or args.assets):
+        parser.error(
+            "--delete requires --category or --assets; "
+            "use --assets all to delete every downloaded wallpaper"
+        )
+
+    if STORAGE_MODE == STORAGE_MODE_LEGACY:
+        try:
+            elevated = os.geteuid() == 0
+        except AttributeError:
+            elevated = True
+        if not elevated:
+            fail(f'Please run as admin: sudo python3 "{__file__}"')
 
     non_interactive = bool(
         args.category or args.assets or args.download or args.delete
@@ -627,26 +909,42 @@ def main():
     print("WallGet Live Wallpaper Download/Delete Script")
     print("---------------------------------------------\n")
 
-    if not STORAGE_MODE:
-        print(
-            "Unable to locate wallpaper manifests in either legacy or user locations."
+    notes: List[str] = []
+    if STORAGE_MODE == STORAGE_MODE_USER:
+        manifest, source, notes = resolve_manifest(USER_AERIALS_BASE)
+        if manifest and source and source != "local manifest":
+            print(f"Catalog source: {source} (local manifest unavailable).\n")
+    elif STORAGE_MODE == STORAGE_MODE_LEGACY:
+        manifest = load_manifest(ACTIVE_ENTRIES_PATH, ACTIVE_STRINGS_PATH)
+        source = "legacy manifest"
+    else:
+        manifest, source = None, ""
+        fail(
+            "Unable to locate a wallpaper store.\n"
+            f"  Checked: {USER_AERIALS_BASE}\n"
+            f"  Checked: {LEGACY_ENTRIES_PATH}\n"
+            "Open System Settings > Wallpaper once so macOS creates its aerials store."
         )
-        exit()
 
-    manifest = load_manifest(ACTIVE_ENTRIES_PATH, ACTIVE_STRINGS_PATH)
     if not manifest:
-        print("Unable to load wallpaper manifest for the active storage location.")
-        exit()
+        details = "\n".join(f"  - {note}" for note in notes) if notes else ""
+        fail(
+            "Unable to load a usable wallpaper catalog.\n"
+            + (details + "\n" if details else "")
+            + f"  Local manifest: {USER_MANIFEST_PATH}\n"
+            + f"  Local archive:  {os.path.join(USER_AERIALS_BASE, 'manifest.tar')}\n"
+            + "If the manifest folder is empty, open System Settings > Wallpaper\n"
+            + "and view the aerial wallpapers once, then run WallGet again."
+        )
 
     strings = extract_strings(manifest)
     categories = extract_categories(manifest)
     if not categories:
-        print("No categories found in the available manifests.")
-        exit()
+        fail("No categories found in the available manifests.")
 
     category_maps = build_category_maps(categories)
     top_level_category_ids: Set[str] = {
-        cat.get("id") for cat in categories if cat.get("id")
+        cat.get("id") for cat in categories if isinstance(cat.get("id"), str)
     }
 
     assets_map, asset_order = extract_assets(manifest)
@@ -659,8 +957,10 @@ def main():
     )
 
     if not assets:
-        print("No assets available to process.")
-        exit()
+        fail(
+            "No assets available to process. The catalog is readable but its "
+            "assets lack usable names or URLs."
+        )
 
     category_menu: List[Tuple[str, str]] = []
     category_asset_counts: Dict[str, int] = defaultdict(int)
@@ -731,7 +1031,7 @@ def main():
         else "All"
     )
 
-    asset_status = gather_asset_status(applicable_assets)
+    asset_status = gather_asset_status(applicable_assets, check_remote=not args.delete)
     grouped_rows, display_rows = build_asset_groups(
         applicable_assets,
         category_menu,
@@ -834,17 +1134,16 @@ def main():
         tasks = delete_targets
 
     if not tasks:
-        print(f"Nothing to {action_text}.")
-        exit()
+        print(f"Nothing to {action_text}.\n\nDone.")
+        return
 
     free_space = shutil.disk_usage("/").free
     print(f"Available space: {format_bytes(free_space)}")
     print(f"Files to {action_text} ({len(tasks)}): {format_bytes(total_bytes)}")
     if action == ACTION_DOWNLOAD and total_bytes > free_space:
-        print("Not enough disk space to download all files.")
-        exit()
+        fail("Not enough disk space to download all files.")
 
-    if not args.yes:
+    if not (args.yes or non_interactive):
         proceed = input(f"{action_text.capitalize()} files? (y/n) ").strip().lower()
         if proceed != "y":
             exit()
