@@ -139,8 +139,9 @@ class CatalogResolutionTests(TempHome):
 
     def test_no_sources_gives_actionable_notes(self):
         with mock.patch.object(wallget, "SYSTEM_AERIALS_RESOURCES", str(self.base / "absent")):
-            with mock.patch.object(wallget, "remote_catalog_urls", return_value=[]):
-                manifest, source, notes = wallget.resolve_manifest(str(self.base))
+            with mock.patch.object(wallget, "system_resource_dirs", return_value=[]):
+                with mock.patch.object(wallget, "remote_catalog_urls", return_value=[]):
+                    manifest, source, notes = wallget.resolve_manifest(str(self.base))
         self.assertIsNone(manifest)
         self.assertEqual(source, "")
         self.assertTrue(any("local manifest: unavailable" in n for n in notes))
@@ -406,10 +407,11 @@ class EndToEndTests(unittest.TestCase):
     def test_no_catalog_exits_nonzero_with_remediation(self):
         (self.base / "manifest").mkdir()
         with self.patched():
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                with self.assertRaises(SystemExit) as ctx:
-                    wallget.main(["--assets", "all", "--delete", "--yes"])
+            with mock.patch.object(wallget, "system_resource_dirs", return_value=[]):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        wallget.main(["--assets", "all", "--delete", "--yes"])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("System Settings > Wallpaper", err.getvalue())
 
@@ -597,7 +599,8 @@ class CoverageEdgeTests(unittest.TestCase):
                                    return_value=plistlib.dumps({"other": "x"})):
                 self.assertEqual(wallget.remote_catalog_urls(str(base)), [])
 
-    def test_resolve_manifest_download_failures_then_success(self):
+    @mock.patch.object(wallget, "system_resource_dirs", return_value=[])
+    def test_resolve_manifest_download_failures_then_success(self, _no_system):
         base = self.root / "aerials"
         (base / "manifest").mkdir(parents=True)
         good = io.BytesIO()
@@ -714,7 +717,8 @@ class CoverageEdgeTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    def test_resolve_manifest_loader_oserror_is_recorded(self):
+    @mock.patch.object(wallget, "system_resource_dirs", return_value=[])
+    def test_resolve_manifest_loader_oserror_is_recorded(self, _no_system):
         base = self.root / "aerials"
         (base / "manifest").mkdir(parents=True)
         with mock.patch.object(wallget, "manifest_from_paths",
@@ -819,6 +823,50 @@ class CoverageEdgeTests(unittest.TestCase):
                         with self.assertRaises(SystemExit) as ctx:
                             wallget.main(["--download", "--yes"])
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_tar_strings_variant_path(self):
+        path = self.root / "variant.tar"
+        with tarfile.open(path, "w") as archive:
+            data = json.dumps(catalog(asset_count=1)).encode()
+            info = tarfile.TarInfo("entries.json")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+            name = "TVIdleScreenStrings.bundle/Localizable.nocache.loctable"
+            raw = plistlib.dumps(loctable())
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
+        manifest = wallget.manifest_from_tar(str(path))
+        self.assertEqual(manifest["strings"]["NAME_0"], "First")
+
+    def test_system_resource_dirs_deduplicates(self):
+        directory = self.root / "Resources"
+        directory.mkdir()
+        with mock.patch.object(wallget, "SYSTEM_AERIALS_RESOURCES", str(directory)):
+            with mock.patch.object(wallget.glob, "glob", return_value=[str(directory)]):
+                self.assertEqual(wallget.system_resource_dirs(), [str(directory)])
+
+    def test_macos_major_and_feed_order(self):
+        with mock.patch.object(wallget.platform, "mac_ver",
+                               return_value=("28.1", ("", "", ""), "")):
+            self.assertEqual(wallget.macos_major(), "28")
+        seen = []
+
+        def fake_read(url, timeout=10):
+            seen.append(url)
+            major = url.split("resources-config-", 1)[1].split("-", 1)[0]
+            return plistlib.dumps({
+                "resources-url": f"https://sylvan.apple.com/{major}.tar"
+            })
+
+        base = self.root / "aerials"
+        base.mkdir()
+        with mock.patch.object(wallget, "macos_major", return_value="28"):
+            with mock.patch.object(wallget.subprocess, "run", side_effect=OSError):
+                with mock.patch.object(wallget, "read_url", side_effect=fake_read):
+                    urls = wallget.remote_catalog_urls(str(base))
+        self.assertTrue(seen[0].endswith("resources-config-28-0.plist"))
+        self.assertTrue(urls[0].endswith("/28.tar"))
 
     def test_format_bytes_edges(self):
         self.assertEqual(wallget.format_bytes(1), "1 byte")

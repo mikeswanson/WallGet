@@ -1,9 +1,11 @@
 import argparse
+import glob
 import http.client
 import io
 import json
 import locale
 import os
+import platform
 import plistlib
 import pwd
 import shutil
@@ -288,10 +290,7 @@ def load_manifest(entries_path: str, strings_path: str) -> Optional[Dict[str, ob
 
 def _tar_members(archive: tarfile.TarFile) -> Dict[str, Any]:
     wanted_entries = ("entries.json", "./entries.json")
-    wanted_strings = (
-        "TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable",
-        "./TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable",
-    )
+    strings_names = ("Localizable.nocache.loctable", "Localizable.nocache.strings")
     entries_data = strings_data = None
     strings_name = ""
     for member in archive.getmembers():
@@ -301,13 +300,15 @@ def _tar_members(archive: tarfile.TarFile) -> Dict[str, Any]:
         if name in wanted_entries and entries_data is None:
             handle = archive.extractfile(member)
             entries_data = handle.read() if handle else None
-        elif name in wanted_strings and strings_data is None:
+        elif (name.startswith("TVIdleScreenStrings.bundle/")
+              and os.path.basename(name) in strings_names
+              and strings_data is None):
             handle = archive.extractfile(member)
             strings_data = handle.read() if handle else None
             strings_name = name
     if entries_data is None:
         return {}
-    result = {"entries": entries_data}
+    result: Dict[str, Any] = {"entries": entries_data}
     if strings_data is not None:
         result["strings"] = strings_data
         result["strings_name"] = strings_name
@@ -345,6 +346,28 @@ def _trusted_catalog_url(url: str) -> bool:
     )
 
 
+def system_resource_dirs() -> List[str]:
+    """All plausible locations of the OS-bundled aerial catalog."""
+    pattern = os.path.join(
+        "/System", "Library", "ExtensionKit", "Extensions",
+        "WallpaperAerialsExtension*.appex", "Contents", "Resources",
+    )
+    candidates = [SYSTEM_AERIALS_RESOURCES] + sorted(glob.glob(pattern))
+    result: List[str] = []
+    seen: Set[str] = set()
+    for directory in candidates:
+        if directory and directory not in seen and os.path.isdir(directory):
+            seen.add(directory)
+            result.append(directory)
+    return result
+
+
+def macos_major() -> Optional[str]:
+    version = platform.mac_ver()[0] or ""
+    major = version.split(".", 1)[0]
+    return major if major.isdigit() else None
+
+
 def remote_catalog_urls(user_base: str) -> List[str]:
     """Resolve Apple's current catalog URL; never hardcode a tar filename."""
     urls: List[str] = []
@@ -368,7 +391,11 @@ def remote_catalog_urls(user_base: str) -> List[str]:
             urls.append(value)
     except (OSError, subprocess.SubprocessError):
         pass
-    for major in ("27", "26"):
+    majors: List[str] = []
+    for major in (macos_major(), "27", "26"):
+        if major and major not in majors:
+            majors.append(major)
+    for major in majors:
         plist_data = read_url(CONFIG_FEED_BASE.format(major), timeout=10)
         if not plist_data:
             continue
@@ -398,10 +425,11 @@ def resolve_manifest(user_base: str) -> Tuple[Optional[Dict[str, object]], str, 
             entries_path, find_strings_path(manifest_dir))),
         ("manifest.tar", lambda: manifest_from_tar(
             os.path.join(user_base, "manifest.tar"))),
-        ("system bundle", lambda: manifest_from_paths(
-            os.path.join(SYSTEM_AERIALS_RESOURCES, "entries.json"),
-            find_strings_path(SYSTEM_AERIALS_RESOURCES))),
     ]
+    for number, directory in enumerate(system_resource_dirs(), start=1):
+        label = "system bundle" if number == 1 else f"system bundle #{number}"
+        candidates.append((label, lambda d=directory: manifest_from_paths(
+            os.path.join(d, "entries.json"), find_strings_path(d))))
     for label, loader in candidates:
         try:
             manifest = loader()
